@@ -1,5 +1,8 @@
-// Promise/A+ implementation from scratch
-// Spec: https://promisesaplus.com/
+// promise.js — Promises/A+ compliant implementation from scratch
+//
+// A Promise represents the eventual result of an async operation.
+// It can be in one of three states: pending, fulfilled, or rejected.
+// Once settled (fulfilled or rejected), it cannot change state.
 
 const PENDING = 'pending';
 const FULFILLED = 'fulfilled';
@@ -9,96 +12,70 @@ export class MyPromise {
   constructor(executor) {
     this._state = PENDING;
     this._value = undefined;
-    this._handlers = [];
+    this._reason = undefined;
+    this._onFulfilled = [];
+    this._onRejected = [];
+
+    const resolve = value => {
+      if (this._state !== PENDING) return;
+      // Handle thenable
+      if (value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function') {
+        value.then(resolve, reject);
+        return;
+      }
+      this._state = FULFILLED;
+      this._value = value;
+      this._onFulfilled.forEach(fn => queueMicrotask(() => fn(this._value)));
+    };
+
+    const reject = reason => {
+      if (this._state !== PENDING) return;
+      this._state = REJECTED;
+      this._reason = reason;
+      this._onRejected.forEach(fn => queueMicrotask(() => fn(this._reason)));
+    };
 
     try {
-      executor(
-        value => this._resolve(value),
-        reason => this._reject(reason)
-      );
+      executor(resolve, reject);
     } catch (err) {
-      this._reject(err);
+      reject(err);
     }
-  }
-
-  _resolve(value) {
-    // If resolving with a thenable, adopt its state
-    if (value && (typeof value === 'object' || typeof value === 'function')) {
-      try {
-        const then = value.then;
-        if (typeof then === 'function') {
-          let called = false;
-          try {
-            then.call(
-              value,
-              y => { if (!called) { called = true; this._resolve(y); } },
-              r => { if (!called) { called = true; this._reject(r); } }
-            );
-          } catch (e) {
-            if (!called) this._reject(e);
-          }
-          return;
-        }
-      } catch (e) {
-        this._reject(e);
-        return;
-      }
-    }
-
-    if (this._state !== PENDING) return;
-    this._state = FULFILLED;
-    this._value = value;
-    this._flush();
-  }
-
-  _reject(reason) {
-    if (this._state !== PENDING) return;
-    this._state = REJECTED;
-    this._value = reason;
-    this._flush();
-  }
-
-  _flush() {
-    queueMicrotask(() => {
-      for (const handler of this._handlers) {
-        this._handle(handler);
-      }
-      this._handlers = [];
-    });
-  }
-
-  _handle({ onFulfilled, onRejected, resolve, reject }) {
-    if (this._state === PENDING) {
-      this._handlers.push({ onFulfilled, onRejected, resolve, reject });
-      return;
-    }
-
-    queueMicrotask(() => {
-      const cb = this._state === FULFILLED ? onFulfilled : onRejected;
-
-      if (!cb) {
-        if (this._state === FULFILLED) resolve(this._value);
-        else reject(this._value);
-        return;
-      }
-
-      try {
-        const result = cb(this._value);
-        resolve(result);
-      } catch (err) {
-        reject(err);
-      }
-    });
   }
 
   then(onFulfilled, onRejected) {
     return new MyPromise((resolve, reject) => {
-      this._handle({
-        onFulfilled: typeof onFulfilled === 'function' ? onFulfilled : null,
-        onRejected: typeof onRejected === 'function' ? onRejected : null,
-        resolve,
-        reject,
-      });
+      const handleFulfilled = value => {
+        try {
+          if (typeof onFulfilled === 'function') {
+            resolve(onFulfilled(value));
+          } else {
+            resolve(value);
+          }
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      const handleRejected = reason => {
+        try {
+          if (typeof onRejected === 'function') {
+            resolve(onRejected(reason));
+          } else {
+            reject(reason);
+          }
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      if (this._state === FULFILLED) {
+        queueMicrotask(() => handleFulfilled(this._value));
+      } else if (this._state === REJECTED) {
+        queueMicrotask(() => handleRejected(this._reason));
+      } else {
+        this._onFulfilled.push(handleFulfilled);
+        this._onRejected.push(handleRejected);
+      }
     });
   }
 
@@ -106,14 +83,15 @@ export class MyPromise {
     return this.then(null, onRejected);
   }
 
-  finally(callback) {
+  finally(onFinally) {
     return this.then(
-      value => MyPromise.resolve(callback()).then(() => value),
-      reason => MyPromise.resolve(callback()).then(() => { throw reason; })
+      value => MyPromise.resolve(onFinally()).then(() => value),
+      reason => MyPromise.resolve(onFinally()).then(() => { throw reason; })
     );
   }
 
-  // Static methods
+  // === Static methods ===
+
   static resolve(value) {
     if (value instanceof MyPromise) return value;
     return new MyPromise(resolve => resolve(value));
@@ -126,37 +104,17 @@ export class MyPromise {
   static all(promises) {
     return new MyPromise((resolve, reject) => {
       const results = [];
-      let remaining = promises.length;
-      if (remaining === 0) { resolve(results); return; }
+      let pending = promises.length;
+
+      if (pending === 0) { resolve([]); return; }
 
       promises.forEach((p, i) => {
         MyPromise.resolve(p).then(
           value => {
             results[i] = value;
-            if (--remaining === 0) resolve(results);
+            if (--pending === 0) resolve(results);
           },
-          reject
-        );
-      });
-    });
-  }
-
-  static allSettled(promises) {
-    return new MyPromise(resolve => {
-      const results = [];
-      let remaining = promises.length;
-      if (remaining === 0) { resolve(results); return; }
-
-      promises.forEach((p, i) => {
-        MyPromise.resolve(p).then(
-          value => {
-            results[i] = { status: 'fulfilled', value };
-            if (--remaining === 0) resolve(results);
-          },
-          reason => {
-            results[i] = { status: 'rejected', reason };
-            if (--remaining === 0) resolve(results);
-          }
+          reject // First rejection rejects the whole thing
         );
       });
     });
@@ -170,17 +128,43 @@ export class MyPromise {
     });
   }
 
+  static allSettled(promises) {
+    return new MyPromise(resolve => {
+      const results = [];
+      let pending = promises.length;
+
+      if (pending === 0) { resolve([]); return; }
+
+      promises.forEach((p, i) => {
+        MyPromise.resolve(p).then(
+          value => {
+            results[i] = { status: 'fulfilled', value };
+            if (--pending === 0) resolve(results);
+          },
+          reason => {
+            results[i] = { status: 'rejected', reason };
+            if (--pending === 0) resolve(results);
+          }
+        );
+      });
+    });
+  }
+
   static any(promises) {
     return new MyPromise((resolve, reject) => {
       const errors = [];
-      let remaining = promises.length;
-      if (remaining === 0) { reject(new AggregateError([], 'All promises were rejected')); return; }
+      let pending = promises.length;
+
+      if (pending === 0) { reject(new AggregateError([], 'All promises were rejected')); return; }
 
       promises.forEach((p, i) => {
-        MyPromise.resolve(p).then(resolve, reason => {
-          errors[i] = reason;
-          if (--remaining === 0) reject(new AggregateError(errors, 'All promises were rejected'));
-        });
+        MyPromise.resolve(p).then(
+          resolve, // First fulfillment resolves
+          reason => {
+            errors[i] = reason;
+            if (--pending === 0) reject(new AggregateError(errors, 'All promises were rejected'));
+          }
+        );
       });
     });
   }
